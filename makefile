@@ -1,11 +1,8 @@
-compile:
-	cargo run > result.asm
+build: 
+	cargo build
+	mv target/debug/tpc tpc
+build_libs: build
+	./tpc o src/pu.tp lib/pu
 
-assemble: compile
-	nasm -f elf64 result.asm
-
-link: assemble
-	gcc result.o -o result -lm
-
-run: link
-	./result
+run: build_libs
+	echo "built libs"

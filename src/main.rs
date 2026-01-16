@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs};
+use std::{collections::HashMap, fs, rc::Rc, env, io::BufWriter, io::Write, process::Command};
 
 #[derive(Debug, PartialEq, Eq)]
 #[allow(unused)]
@@ -145,7 +145,7 @@ impl Lexer {
                 Some(ch) => ch,
             };
 
-            if c.is_alphabetic() {
+            if c.is_alphabetic() || c == '_' {
                 is_line_start = false;
                 let firstchar = self.current_position;
                 loop {
@@ -153,7 +153,7 @@ impl Lexer {
                         None => break,
                         Some(ch) => c = ch,
                     }
-                    if !c.is_alphanumeric() {
+                    if !(c.is_alphanumeric() || c == '_') {
                         break;
                     }
 
@@ -163,7 +163,6 @@ impl Lexer {
                 let mut prefix = "keyword";
 
                 let token = match name.as_str() {
-                    "tawa" => Word::Tawa,
                     "ale" => Word::Ale,
                     "sin" => Word::Sin,
 		    "a" => Word::A,
@@ -232,7 +231,20 @@ impl Lexer {
                 }
             } else if c == '"' {
                 is_line_start = false;
-                todo!("String Literals");
+                let firstchar = self.current_position;
+                loop {
+                    match self.peek() {
+                        None => break,
+                        Some(ch) => c = ch,
+                    }
+                    if c == '"' {
+                        break;
+                    }
+
+                    self.consume();
+                }
+                let string = self.buffer[firstchar..self.current_position].to_string();
+		words.push(Word::StringLiteral(string));
             } else if c == '\n' {
                 line_number += 1;
                 is_line_start = true;
@@ -618,6 +630,10 @@ impl Abstracter {
             match word {
                 Word::Name(_) => self.tokenize_name(),
                 Word::Number(_) => self.tokenize_number(),
+		Word::StringLiteral(string) => {
+		    self.push(Token::StringLiteral(string.to_string()));
+		    self.consume();
+		}
                 Word::O => self.tokenize_o(),
                 Word::Tenpo => self.tokenize_tenpo(),
                 Word::Plus | Word::Minus | Word::ForwardSlash | Word::Star | Word::Equals => {
@@ -682,10 +698,10 @@ enum Expression {
 }
 
 impl Expression {
-    fn get_type(&self, scope: &Scope) -> VariableType {
+    fn get_type_name(&self, scope: &Scope) -> String {
         match self {
-            Self::Unary(unary) => (*unary).get_type(scope).unwrap(),
-            Self::Binary(binary) => (*binary).get_type(scope),
+            Self::Unary(unary) => (*unary).get_type_name(scope).unwrap(),
+            Self::Binary(binary) => (*binary).get_type_name(scope),
         }
     }
 }
@@ -709,22 +725,22 @@ struct BinaryExpression {
 }
 
 impl BinaryExpression {
-    fn get_type(&self, scope: &Scope) -> VariableType {
+    fn get_type_name(&self, scope: &Scope) -> String {
         let lhstype = match &*self.lhs {
-            Expression::Binary(binary) => binary.get_type(scope),
+            Expression::Binary(binary) => binary.get_type_name(scope),
             Expression::Unary(unary) => unary
-                .get_type(scope)
+                .get_type_name(scope)
                 .expect("binary expression hand has no type"),
         };
 
         let rhstype = match &*self.rhs {
-            Expression::Binary(binary) => binary.get_type(scope),
+            Expression::Binary(binary) => binary.get_type_name(scope),
             Expression::Unary(unary) => unary
-                .get_type(scope)
+                .get_type_name(scope)
                 .expect("binary expression hand has no type"),
         };
 
-        if std::mem::discriminant(&lhstype) == std::mem::discriminant(&rhstype) {
+        if lhstype == rhstype {
             return rhstype;
         } else {
             panic!(
@@ -761,12 +777,12 @@ enum UnaryExpression {
 }
 
 impl UnaryExpression {
-    fn get_type(&self, scope: &Scope) -> Option<VariableType> {
+    fn get_type_name(&self, scope: &Scope) -> Option<String> {
         match self {
-            Self::Nanpa(_) => Some(VariableType::Nanpa),
-            Self::Linja(_) => Some(VariableType::Linja),
-            Self::Nimi(nimi) => Some(scope.get_variable(&nimi.value).unwrap().0.variable_type),
-            Self::O(o) => Some(scope.get_function(&o.nimi.value).unwrap().return_type?),
+            Self::Nanpa(_) => Some("nanpa".to_string()),
+            Self::Linja(_) => Some("linja".to_string()),
+            Self::Nimi(nimi) => Some(scope.get_variable(&nimi.value).unwrap().0.type_name.clone()),
+            Self::O(o) => Some(scope.get_function(&o.nimi.value).unwrap().return_type.clone()?),
         }
     }
 }
@@ -781,21 +797,14 @@ struct Parenthesis {
     nodes: Vec<Node>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum VariableType {
-    Nanpa,
-    NanpaLili,
-    NanpaSuli,
-    Telo,
-    TeloLili,
-    TeloSuli,
-    Pulean,
-    Linja,
-}
-
 #[derive(Debug)]
 struct OtawaStatement {
     expr: Box<Expression>,
+}
+
+#[derive(Debug)]
+struct KepekenStatement {
+    nimi: NimiExpression
 }
 
 #[derive(Debug)]
@@ -805,7 +814,7 @@ struct OWekaStatement {
 
 #[derive(Debug)]
 struct OSinStatement {
-    var_type: VariableType,
+    var_type: String,
     name: NimiExpression,
     expr: Option<Box<Expression>>,
 }
@@ -819,9 +828,16 @@ struct LiKamaSamaStatement {
 #[derive(Debug)]
 struct PaliStatement {
     nimi: NimiExpression,
-    params: Vec<(VariableType, NimiExpression)>,
+    params: Vec<(String, NimiExpression)>,
     nodes: Vec<Node>,
-    retval: Option<VariableType>,
+    retval: Option<String>,
+}
+
+#[derive(Debug)]
+struct PaliDeclaration {
+    nimi: NimiExpression,
+    params: Vec<(String, NimiExpression)>,
+    retval: Option<String>
 }
 
 #[derive(Debug)]
@@ -852,10 +868,12 @@ enum Node {
     Otawa(Box<OtawaStatement>),
     OSin(Box<OSinStatement>),
     Pali(Box<PaliStatement>),
+    PaliDeclaration(Box<PaliDeclaration>),
     O(Box<OExpression>),
     OpeningTab(usize),
     OWeka(Box<OWekaStatement>),
     Parenthesis(Box<Parenthesis>),
+    Kepeken(Box<KepekenStatement>)
 }
 
 struct Parser {
@@ -925,6 +943,18 @@ impl Parser {
         }
     }
 
+    fn parse_kepeken(&mut self) -> Result<KepekenStatement, String> {
+	if !self.expect(Token::StringLiteral("".to_string())) {
+	    return Err("not a kepeken statement".to_string());
+	}
+
+	let nimi = self.parse_nimi_expression()?;
+
+	return Ok(KepekenStatement{
+	    nimi
+	})
+    }
+    
     fn parse_unary_expression(&mut self) -> Result<UnaryExpression, String> {
         let token = match self.peek() {
             None => panic!(),
@@ -989,7 +1019,7 @@ impl Parser {
             let lhs_expr2 = lhs_expr;
 
             // get variable type
-            let vartype: VariableType;
+            let vartype: String;
             let binary_expression = BinaryExpression {
                 kind: binary_type,
                 lhs: Box::new(lhs_expr2),
@@ -1052,7 +1082,7 @@ impl Parser {
         })
     }
 
-    // o 'name' kepeken 'name' en 'name'.
+    // o 'name' e 'name' e 'name'.
     fn parse_o(&mut self) -> Result<OExpression, String> {
         if !self.expect(Token::O) {
             return Err("not an o expression".to_string());
@@ -1064,14 +1094,14 @@ impl Parser {
         // params
         let mut params: Vec<Expression> = Vec::new();
 
-        // kepeken
-        if self.expect(Token::Kepeken) {
+        // e
+        if self.expect(Token::E) {
             self.consume();
 
             loop {
                 params.push(self.parse_expression(Precedence::Undefined)?);
 
-                if !self.expect(Token::En) {
+                if !self.expect(Token::E) {
                     break;
                 }
                 self.consume();
@@ -1102,7 +1132,7 @@ impl Parser {
     }
 
     // pali 'name' li kepeken 'args' li pali e ni:
-    fn parse_pali(&mut self) -> Result<PaliStatement, String> {
+    fn parse_pali(&mut self) -> Result<(Option<PaliStatement>, Option<PaliDeclaration>), String> {
         if !self.expect(Token::Pali) {
             return Err("not a pali statement".to_string());
         }
@@ -1110,13 +1140,9 @@ impl Parser {
 
         let mut nimi = self.parse_nimi_expression()?;
 
-        if nimi.value == "wawa" {
-            nimi.value = "main".to_string();
-        }
-
-        let mut params: Vec<(VariableType, NimiExpression)> = Vec::new();
+        let mut params: Vec<(String, NimiExpression)> = Vec::new();
         let mut has_params = false;
-        let mut retval: Option<VariableType> = None;
+        let mut retval: Option<String> = None;
         let mut has_type = false;
         loop {
             if self.expect(Token::LiPanaE) && !has_type {
@@ -1141,7 +1167,15 @@ impl Parser {
         }
 
         if !self.expect(Token::LiPaliENi) {
-            return Err("no 'li pali e ni' in pali statement".to_string());
+	    return Ok(
+		(None,
+		 Some(PaliDeclaration{
+		     nimi,
+		     params,
+		     retval,
+		 })
+		)
+	    );
         }
         self.consume();
 
@@ -1164,23 +1198,23 @@ impl Parser {
             nodes.push(oweka);
         }
 
-        Ok(PaliStatement {
+        Ok((Some(PaliStatement {
             nimi,
             params,
             nodes,
             retval,
-        })
+        }), None))
     }
 
-    fn parse_type(&mut self) -> Result<VariableType, String> {
+    fn parse_type(&mut self) -> Result<String, String> {
         let token = match self.peek() {
             None => return Err("Unexpected end of file".to_string()),
             Some(token) => token,
         };
 
         let vartype = match token {
-            Token::Nanpa => VariableType::Nanpa,
-            Token::Linja => VariableType::Linja,
+            Token::Nanpa => "nanpa".to_string(),
+            Token::Linja => "linja".to_string(),
             _ => return Err("Not a type".to_string()),
         };
         self.consume();
@@ -1213,7 +1247,7 @@ impl Parser {
         Ok(OSinStatement {
             expr: None,
             name: name,
-            var_type: VariableType::Nanpa,
+            var_type: "nanpa".to_string(),
         })
     }
 
@@ -1268,7 +1302,14 @@ impl Parser {
             Token::Tenpo => todo!("Tenpo"),
             Token::Name(_) => Node::LiKamaSama(Box::new(self.parse_li_kama_sama().unwrap())),
             Token::OSin => Node::OSin(Box::new(self.parse_o_sin().unwrap())),
-            Token::Pali => Node::Pali(Box::new(self.parse_pali().unwrap())),
+	    Token::Pali => {
+		let pali = self.parse_pali().unwrap();
+		if pali.1.is_some() {
+		    Node::PaliDeclaration(Box::new(pali.1.unwrap()))
+		} else {
+		    Node::Pali(Box::new(pali.0.unwrap()))
+		}
+	    },
             Token::OpeningTab(tabs) => {
                 let tabs = *tabs;
                 self.consume();
@@ -1280,9 +1321,9 @@ impl Parser {
                 Node::Parenthesis(Box::new(self.parse_parenthesis().unwrap()))
             }
             Token::TenpoPi => Node::Tenpo(Box::new(self.parse_tenpo().unwrap())),
+	    Token::Kepeken => Node::Kepeken(Box::new(self.parse_kepeken().unwrap())),
             _ => todo!("{:#?}", token),
         };
-
         node
     }
 
@@ -1301,14 +1342,14 @@ impl Parser {
 
 #[derive(Debug)]
 struct Variable {
-    variable_type: VariableType,
+    type_name: String,
     stack_pos: usize,
 }
 
 #[derive(Debug)]
 struct Function {
-    return_type: Option<VariableType>,
-    parameter_types: Vec<VariableType>,
+    return_type: Option<String>,
+    parameter_types: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1324,8 +1365,15 @@ struct Environment {
 }
 
 #[derive(Debug)]
+struct Type {
+    size: usize,
+    name: String
+}
+
+#[derive(Debug)]
 struct Scope {
     functions: HashMap<String, Function>,
+    types: HashMap<String, Rc<Type>>,
     envs: Vec<Environment>,
     label_counter: usize,
 }
@@ -1339,21 +1387,43 @@ impl Scope {
         self.envs.last().unwrap()
     }
 
+    fn get_type(&self, name: &str) -> Option<Rc<Type>> {
+	self.types.get(name).cloned()
+    }
+    
     fn add_function(&mut self, pali: &PaliStatement) {
         self.functions.insert(
             pali.nimi.value.to_owned(),
             Function {
-                return_type: pali.retval,
+                return_type: pali.retval.clone(),
                 parameter_types: pali.params.iter().map(|val| val.0.clone()).collect(),
             },
         );
     }
 
-    fn add_variable(&mut self, name: &str, variable_type: VariableType) -> &EnvironmentName {
-        self.get_environment_mut().add_name(name, variable_type)
+    fn declare_function(&mut self, pali: &PaliDeclaration) {
+	self.functions.insert(
+            pali.nimi.value.to_owned(),
+            Function {
+                return_type: pali.retval.clone(),
+                parameter_types: pali.params.iter().map(|val| val.0.clone()).collect(),
+            },
+        );
     }
 
-    fn get_variable(&self, name: &str) -> Result<(&Variable, usize), String> {
+    fn add_variable(&mut self, name: &str, variable_type: &str, reg: Option<&str>, writer: &mut BufWriter<fs::File>) -> &EnvironmentName {
+	let size = self.get_type(variable_type).unwrap().size;
+
+	if reg.is_some() { 
+	    Generator::push_reg(reg.unwrap(), size, self, writer);
+	} else {
+	    println!("    sub rsp, {size}");
+	}
+	
+        self.get_environment_mut().add_name(name, size, variable_type)
+    }
+
+    fn get_variable(&self, name: &str) -> Result<(&Variable, isize), String> {
         let mut found_env_index = 0;
         let mut variable: Option<&Variable> = None;
         for env in (&self.envs).into_iter().enumerate().rev() {
@@ -1377,17 +1447,26 @@ impl Scope {
             unreachable!();
         }
 
-        let mut base_offset = 0usize;
+        let mut start_offset = 0usize;
         for (index, env) in (&self.envs).iter().enumerate() {
             if index != found_env_index {
-                base_offset += env.stack_pointer;
+                start_offset += env.stack_pointer;
             } else {
-                base_offset += variable.unwrap().stack_pos;
-                return Ok((variable.unwrap(), base_offset));
+                start_offset += variable.unwrap().stack_pos;
+                break;
             }
         }
 
-        unreachable!();
+	let mut base_offset  = 0usize;
+        for (index, env) in (&self.envs).iter().enumerate() {
+	    if self.envs.len() - 1 == index {
+		break;
+	    }
+            base_offset += env.stack_pointer;
+        }
+
+	Ok((variable.unwrap(), start_offset as isize - base_offset as isize))
+        
     }
 
     fn get_function(&self, name: &str) -> Result<&Function, String> {
@@ -1399,15 +1478,15 @@ impl Scope {
 }
 
 impl Environment {
-    fn add_name(&mut self, name: &str, variable_type: VariableType) -> &EnvironmentName {
+    fn add_name(&mut self, name: &str, size: usize, variable_type: &str) -> &EnvironmentName {
         self.names.insert(
             name.to_string(),
             EnvironmentName::Variable(Variable {
-                variable_type,
+                type_name: variable_type.to_string(),
                 stack_pos: self.stack_pointer,
             }),
-        );
-        self.stack_pointer += 1;
+        );	
+        
         self.names.get(&name.to_string()).unwrap()
     }
 
@@ -1449,58 +1528,73 @@ impl Generator {
 	}.to_string()
     }
 
-    fn push(i: isize, scope: &mut Scope) {
-        println!("    mov r8, {i}");
-        println!("    push r8");
-        scope.get_environment_mut().stack_pointer += 1;
+    fn get_word_from_size(size: usize) -> String {
+	String::from(match size {
+	    1 => "byte",
+	    2 => "word",
+	    4 => "dword",
+	    8 => "qword",
+	    _ => todo!()
+	})
+    }
+    
+    fn push(i: isize, size: usize, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        writeln!(writer, "    mov r8, {i}");
+        writeln!(writer, "    push r8");
+        scope.get_environment_mut().stack_pointer += size;
     }
 
-    fn push_reg(reg: &str, scope: &mut Scope) {
-        println!("    push {reg}");
-        scope.get_environment_mut().stack_pointer += 1;
+    fn push_reg(reg: &str, size: usize, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        writeln!(writer, "    push {} {reg}", Self::get_word_from_size(size));
+        scope.get_environment_mut().stack_pointer += size;
     }
 
-    fn pop_reg(reg: &str, scope: &mut Scope) {
-        println!("    pop {reg}");
-        scope.get_environment_mut().stack_pointer -= 1;
+    fn pop_reg(reg: &str, size: usize, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        writeln!(writer, "    pop {} {reg}", Self::get_word_from_size(size));
+        scope.get_environment_mut().stack_pointer -= size;
     }
 
-    fn mov(to: &str, from: &str) {
-        println!("    mov {to}, {from}");
+    fn mov(to: &str, size: usize, from: &str, writer: &mut BufWriter<fs::File>) {
+        writeln!(writer, "    mov {to}, {} {from}", Self::get_word_from_size(size));
     }
 
-    fn zero(reg: &str) {
-        println!("    xor {reg}, {reg}");
+    fn zero(reg: &str, writer: &mut BufWriter<fs::File>) {
+        writeln!(writer, "    xor {reg}, {reg}");
     }
 
-    fn generate_nanpa_expression(nanpa_expression: &NanpaExpression, scope: &mut Scope) {
-        Generator::push(nanpa_expression.value, scope);
+    fn generate_nanpa_expression(nanpa_expression: &NanpaExpression, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        Generator::push(nanpa_expression.value, 8, scope, writer);
     }
 
-    fn generate_nimi_expression(nimi_expression: &NimiExpression, scope: &mut Scope) {
+    fn generate_nimi_expression(nimi_expression: &NimiExpression, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
         let (name, offset) = scope.get_variable(&nimi_expression.value).unwrap();
-        println!();
-        println!(
+        writeln!(writer, );
+        writeln!(writer, 
             "    ; Getting value of variable {} with offset {}",
             nimi_expression.value, offset
         );
-        Self::push_reg(format!("[rbp - {}]", (offset) * 8).as_str(), scope);
+        Self::push_reg(format!("[rbp - {}]", offset).as_str(), scope.get_type(&name.type_name).unwrap().size, scope, writer);
     }
 
+    fn generate_kepeken(kepeken_statement: &KepekenStatement) {
+	todo!();
+    }
+    
     fn generate_nimi_new(
         nimi_expression: &NimiExpression,
-        variable_type: VariableType,
+        variable_type: &str,
         scope: &mut Scope,
+	writer: &mut BufWriter<fs::File>
     ) {
         match scope.get_environment().get_variable(&nimi_expression.value) {
             Err(_) => {
-                println!();
-                println!(
-                    "    ; o sin e {:#?} {}",
+                writeln!(writer, );
+                writeln!(writer, 
+                    "    ; new {} {}",
                     variable_type, nimi_expression.value,
                 );
-                println!("    sub rsp, 8");
-                scope.add_variable(&nimi_expression.value, variable_type);
+                
+                scope.add_variable(&nimi_expression.value, variable_type, None, writer);
             }
             Ok(_) => {
                 panic!(
@@ -1513,133 +1607,130 @@ impl Generator {
 
     fn generate_nimi_recieve_stack(
         nimi_expression: &NimiExpression,
-        variable_type: Option<VariableType>,
+        variable_type: Option<&str>,
         scope: &mut Scope,
+	writer: &mut BufWriter<fs::File>
     ) {
         match scope.get_variable(&nimi_expression.value) {
             Err(_) => {
                 panic!("No variable named {}", nimi_expression.value);
             }
             Ok((name, offset)) => {
-                println!();
-                println!("    ; Setting variable {}", nimi_expression.value);
-                Generator::pop_reg("r9", scope);
-
-                let offset = offset * 8;
-                Generator::mov(format!("[rbp - {offset}]").as_str(), "r9");
+                writeln!(writer, );
+                writeln!(writer, "    ; Setting variable {}", nimi_expression.value);
+		let size = scope.get_type(&name.type_name).unwrap().size;
+                Generator::pop_reg("r9", scope.get_type(&name.type_name).unwrap().size, scope, writer);
+		
+                Generator::mov(format!("[rbp - {offset}]").as_str(), size, "r9", writer);
             }
         };
     }
 
-    fn generate_o_sin(osin: &OSinStatement, scope: &mut Scope) {
+    fn generate_o_sin(osin: &OSinStatement, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
         match &osin.expr {
-            Some(expr) => Self::generate_expression(&expr, scope),
+            Some(expr) => Self::generate_expression(&expr, scope, writer),
             None => {}
         };
 
-        Self::generate_nimi_new(&osin.name, osin.var_type, scope);
+        Self::generate_nimi_new(&osin.name, &osin.var_type, scope, writer);
     }
 
-    fn generate_li_kama_sama_statement(kama_sama: &LiKamaSamaStatement, scope: &mut Scope) {
-        println!("");
+    fn generate_li_kama_sama_statement(kama_sama: &LiKamaSamaStatement, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        writeln!(writer, "");
 
-        Self::generate_expression(&kama_sama.expression, scope);
+        Self::generate_expression(&kama_sama.expression, scope, writer);
 
-        Self::generate_nimi_recieve_stack(&kama_sama.nimi, None, scope);
+        Self::generate_nimi_recieve_stack(&kama_sama.nimi, None, scope, writer);
     }
 
-    fn generate_unary_expression(unary: &UnaryExpression, scope: &mut Scope) {
+    fn generate_unary_expression(unary: &UnaryExpression, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
         match unary {
-            UnaryExpression::Nanpa(nanpa) => Self::generate_nanpa_expression(nanpa, scope),
-            UnaryExpression::Nimi(nimi) => Self::generate_nimi_expression(nimi, scope),
-            UnaryExpression::O(o) => Self::generate_o(o, scope),
+            UnaryExpression::Nanpa(nanpa) => Self::generate_nanpa_expression(nanpa, scope, writer),
+            UnaryExpression::Nimi(nimi) => Self::generate_nimi_expression(nimi, scope, writer),
+            UnaryExpression::O(o) => Self::generate_o(o, scope, writer),
             UnaryExpression::Linja(linja) => {}
         }
     }
 
-    fn generate_binary_expression(binary: &BinaryExpression, scope: &mut Scope) {
-        Self::generate_expression(&binary.lhs, scope);
-        Self::generate_expression(&binary.rhs, scope);
-        Self::pop_reg("r9", scope);
-        Self::pop_reg("r8", scope);
-
+    fn generate_binary_expression(binary: &BinaryExpression, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        Self::generate_expression(&binary.lhs, scope, writer);
+        Self::generate_expression(&binary.rhs, scope, writer);
+	let sizel = scope.get_type(&binary.lhs.get_type_name(scope)).unwrap().size;
+	let sizer = scope.get_type(&binary.rhs.get_type_name(scope)).unwrap().size;
+        Self::pop_reg("r9", sizel, scope, writer);
+        Self::pop_reg("r8", sizer, scope, writer);
+	let size: usize = scope.get_type(binary.get_type_name(scope).as_str()).unwrap().size;
+	
         match binary.kind {
             BinaryExpressionType::Add => {
-                println!("    add r8, r9");
-                Self::push_reg("r8", scope);
+                writeln!(writer, "    add r8, r9");
+                Self::push_reg("r8", size, scope, writer);
             }
             BinaryExpressionType::Subtract => {
-                println!("    sub r8, r9");
-                Self::push_reg("r8", scope);
+                writeln!(writer, "    sub r8, r9");
+                Self::push_reg("r8", size, scope, writer);
             }
             BinaryExpressionType::Multiply => {
-                Self::mov("rax", "r8");
-                println!("    mul r9");
-                Self::push_reg("rax", scope);
+                Self::mov("rax", size, "r8", writer);
+                writeln!(writer, "    mul r9");
+                Self::push_reg("rax", size, scope, writer);
             }
             BinaryExpressionType::Divide => {
-                Self::zero("rdx");
-                Self::mov("rax", "r8");
-                println!("    div r9");
-                Self::push_reg("rax", scope);
+                Self::zero("rdx", writer);
+                Self::mov("rax", size, "r8", writer);
+                writeln!(writer, "    div r9");
+                Self::push_reg("rax", size, scope, writer);
             }
             BinaryExpressionType::Equals => {
-                Self::zero("ecx");
-                println!("    cmp r8, r9");
-                println!("    setz cl");
-                Self::push_reg("rcx", scope);
+                Self::zero("ecx", writer);
+                writeln!(writer, "    cmp r8, r9");
+                writeln!(writer, "    setz cl");
+                Self::push_reg("rcx", size, scope, writer);
             }
             _ => {}
         }
     }
 
-    fn generate_expression(expression: &Expression, scope: &mut Scope) {
+    fn generate_expression(expression: &Expression, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
         match expression {
-            Expression::Unary(unary) => Self::generate_unary_expression(unary, scope),
-            Expression::Binary(binary) => Self::generate_binary_expression(binary, scope),
+            Expression::Unary(unary) => Self::generate_unary_expression(unary, scope, writer),
+            Expression::Binary(binary) => Self::generate_binary_expression(binary, scope, writer),
         };
     }
 
-    fn generate_otawa(otawa: &OtawaStatement, scope: &mut Scope) {
-        if std::mem::discriminant(&otawa.expr.get_type(scope))
-            != std::mem::discriminant(&VariableType::Nanpa)
-        {
-            panic!("otawa expression is not of type {:#?}", VariableType::Nanpa);
-        }
-        Self::generate_expression(&otawa.expr, scope);
-        println!();
-        println!("    ; Exit call:");
-        Self::pop_reg("rdi", scope);
-        Self::mov("rax", "60");
-        println!("    syscall");
-        println!();
+    fn generate_otawa(otawa: &OtawaStatement, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        Self::generate_expression(&otawa.expr, scope, writer);
+	let size = scope.get_type(&otawa.expr.get_type_name(scope)).unwrap().size;
+        writeln!(writer, );
+        writeln!(writer, "    ; Exit call:");
+        Self::pop_reg("rdi", size, scope, writer);
+        Self::mov("rax", size, "60", writer);
+        writeln!(writer, "    syscall");
+        writeln!(writer, );
     }
 
     fn generate_parameter(
-        param: &(VariableType, NimiExpression),
+        param: &(String, NimiExpression),
         scope: &mut Scope,
         offset: usize,
+	writer: &mut BufWriter<fs::File>
     ) {
-        println!("    ; Setting parameter {}", param.1.value);
-        Self::push_reg(&Self::get_argument_register(offset).as_str(), scope);
-
-        scope
-            .get_environment_mut()
-            .add_name(&param.1.value, param.0);
+        writeln!(writer, "    ; Setting parameter {} of type {}", param.1.value, param.0);
+        scope.add_variable(&param.1.value, param.0.as_str(), Some(&Self::get_argument_register(offset)), writer);
     }
 
-    fn generate_o(o: &OExpression, scope: &mut Scope) {
+    fn generate_o(o: &OExpression, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
         let func = scope.get_function(&o.nimi.value).unwrap();
 
         let types = func.parameter_types.clone();
         let return_type = func.return_type.clone();
 
-        println!();
-        println!("    ; o {}", o.nimi.value);
+        writeln!(writer, );
+        writeln!(writer, "    ; o {}", o.nimi.value);
 
         if (&o.params)
             .into_iter()
-            .map(|v| return v.get_type(scope))
+            .map(|v| return v.get_type_name(scope))
             .collect::<Vec<_>>()
             != types
         {
@@ -1647,89 +1738,95 @@ impl Generator {
         }
 
         for (index, expr) in o.params.iter().enumerate().rev() {
-            Self::generate_expression(expr, scope);
-	    Self::pop_reg(&Self::get_argument_register(index), scope);
+            Self::generate_expression(expr, scope, writer);
+	    let size = scope.get_type(&expr.get_type_name(scope)).unwrap().size;
+	    Self::pop_reg(&Self::get_argument_register(index), size, scope, writer);
         }
 
-        println!("    call {}", o.nimi.value);
-
-//        println!("    add rsp, {}", o.params.len() * 8 + 4);
-	//        scope.get_environment_mut().stack_pointer -= o.params.len();
-	println!("    add rsp, 4");
+        writeln!(writer, "    call {}", o.nimi.value);
 
         if return_type.is_some() {
-            Generator::push_reg("rax", scope);
+	    let size = scope.get_type(&return_type.unwrap()).unwrap().size;
+            Generator::push_reg("rax", size, scope, writer);
         };
     }
 
-    fn generate_o_weka(oweka: &OWekaStatement, scope: &mut Scope) {
+    fn generate_o_weka(oweka: &OWekaStatement, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
         match &oweka.expr {
             None => {}
             Some(expr) => {
-                Self::generate_expression(&expr, scope);
-                Self::pop_reg("rax", scope);
+		let size = scope.get_type(&expr.get_type_name(scope)).unwrap().size;
+                Self::generate_expression(&expr, scope, writer);
+                Self::pop_reg("rax", size, scope, writer);
             }
         }
 
-        println!("    ; returning");
-        Self::mov("rsp", "rbp");
-        println!("    pop rbp");
-        println!("    ret");
+        writeln!(writer, "    ; returning");
+        Self::mov("rsp", 8, "rbp", writer);
+        writeln!(writer, "    pop rbp");
+        writeln!(writer, "    ret");
     }
 
-    fn generate_tenpo(tenpo: &TenpoStatement, scope: &mut Scope) {
+    fn generate_tenpo(tenpo: &TenpoStatement, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
         scope.label_counter += 1;
         let label_index = scope.label_counter;
-        println!("  ; tenpo .. la");
-	Self::new_scope(scope);
-        Self::generate_expression(&tenpo.expr, scope);
-        Self::pop_reg("rax", scope);
-        println!("    cmp rax, 0");
-        println!("    je .endif_{label_index}");
+        writeln!(writer, "  ; tenpo .. la");
+	Self::new_scope(scope, writer);
+        Self::generate_expression(&tenpo.expr, scope, writer);
+	let size = scope.get_type(&tenpo.expr.get_type_name(scope)).unwrap().size;
+        Self::pop_reg("rax", size, scope, writer);
+        writeln!(writer, "    cmp rax, 0");
+        writeln!(writer, "    je .endif_{label_index}");
 	
         for node in &tenpo.nodes {
-            if Self::generate_node(node, scope) {
+            if Self::generate_node(node, scope, writer) {
                 break;
             }
         }
-        println!(
+        writeln!(writer, 
             "    add rsp, {}",
             scope.get_environment_mut().names.len() * 8
         );
 
-	Self::end_scope(scope);
+	Self::end_scope(scope, writer);
 	
-        println!("  .endif_{label_index}:");
+        writeln!(writer, "  .endif_{label_index}:").unwrap();
     }
 
-    fn generate_pali(pali: &PaliStatement, scope: &mut Scope) {
+    fn generate_pali_declaration(pali: &PaliDeclaration, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+	scope.declare_function(pali);
+
+	writeln!(writer, "extrn {0}", pali.nimi.value).unwrap();
+    }
+    
+    fn generate_pali(pali: &PaliStatement, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
         scope.add_function(pali);
-	
-        println!("{}:", pali.nimi.value);
-        Self::new_scope(scope);
-        Self::push_reg("rbp", scope);
-        println!("    mov rbp, rsp");
+
+        writeln!(writer, "public {}", pali.nimi.value).unwrap();
+        writeln!(writer, "{}:", pali.nimi.value).unwrap();
+        Self::new_scope(scope, writer);
+        Self::push_reg("rbp", 8, scope, writer);
+        writeln!(writer, "    mov rbp, rsp").unwrap();
 
         if !pali.params.is_empty() {
             let mut offset = 0;
             for param in &pali.params {
-                scope.get_environment_mut().stack_pointer = offset;
-                Self::generate_parameter(param, scope, offset);
+                Self::generate_parameter(param, scope, offset, writer);
                 offset += 1;
             }
         }
 
         for node in &pali.nodes {
-            if Self::generate_node(node, scope) {
+            if Self::generate_node(node, scope, writer) {
                 break;
             };
         }
 	
-	Self::end_scope(scope);
+	Self::end_scope(scope, writer);
     }
 
-    fn new_scope(scope: &mut Scope) {
-        println!("  ; new scope");
+    fn new_scope(scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        writeln!(writer, "  ; new scope");
         scope.envs.push(Environment {
             names: HashMap::new(),
             stack_pointer: 0,
@@ -1737,67 +1834,98 @@ impl Generator {
         });
     }
 
-    fn end_scope(scope: &mut Scope) {
+    fn end_scope(scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
         scope.envs.pop();
-        println!("  ; end of scope");
-	println!();
+        writeln!(writer, "  ; end of scope");
+	writeln!(writer, );
     }
 
-    fn generate_parenthesis(paren: &Parenthesis, scope: &mut Scope) {
-        println!();
-        Self::new_scope(scope);
+    fn generate_parenthesis(paren: &Parenthesis, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        writeln!(writer, );
+        Self::new_scope(scope, writer);
 
         for node in &paren.nodes {
-            Self::generate_node(node, scope);
+            Self::generate_node(node, scope, writer);
         }
 
-        println!(
+        writeln!(writer, 
             "    add rsp, {}",
             scope.get_environment_mut().names.len() * 8
         );
-	Self::end_scope(scope);
+	Self::end_scope(scope, writer);
     }
 
-    fn generate_node(node: &Node, scope: &mut Scope) -> bool {
+    fn generate_node(node: &Node, scope: &mut Scope, writer: &mut BufWriter<fs::File>) -> bool {
         match node {
             Node::Otawa(otawa) => {
-                Self::generate_otawa(otawa, scope);
+                Self::generate_otawa(otawa, scope, writer);
                 return true;
             }
-            Node::Tenpo(tenpo) => Self::generate_tenpo(tenpo, scope),
-            Node::Expression(expression) => Self::generate_expression(expression, scope),
-            Node::OSin(osin) => Self::generate_o_sin(osin, scope),
-            Node::LiKamaSama(kamasama) => Self::generate_li_kama_sama_statement(kamasama, scope),
-            Node::Pali(pali) => Self::generate_pali(pali, scope),
+            Node::Tenpo(tenpo) => Self::generate_tenpo(tenpo, scope, writer),
+            Node::Expression(expression) => Self::generate_expression(expression, scope, writer),
+            Node::OSin(osin) => Self::generate_o_sin(osin, scope, writer),
+            Node::LiKamaSama(kamasama) => Self::generate_li_kama_sama_statement(kamasama, scope, writer),
+            Node::Pali(pali) => Self::generate_pali(pali, scope, writer),
+	    Node::PaliDeclaration(pali) => Self::generate_pali_declaration(pali, scope, writer),
             Node::OWeka(oweka) => {
-                Self::generate_o_weka(oweka, scope);
+                Self::generate_o_weka(oweka, scope, writer);
                 return true;
             }
             Node::O(o) => {
-                Self::generate_o(o, scope);
-                Self::pop_reg("rax", scope);
+                Self::generate_o(o, scope, writer);
+		let func = scope.get_function(&o.nimi.value).unwrap();
+		if func.return_type.is_some()  {
+		    let size = scope.get_type(&func.return_type.clone().unwrap()).unwrap().size;
+		    Self::pop_reg("rax", size, scope, writer);
+		}
             }
-            Node::Parenthesis(paren) => Self::generate_parenthesis(paren, scope),
+            Node::Parenthesis(paren) => Self::generate_parenthesis(paren, scope, writer),
             _ => {}
         };
         false
     }
 
-    fn generate(&mut self, scope: &mut Scope) {
-        println!("global main");
+    fn generate_prelude(&mut self, writer: &mut BufWriter<fs::File>) {
+	writeln!(writer, "format ELF64");
+    }
+    
+    fn generate(&mut self, scope: &mut Scope, writer: &mut BufWriter<fs::File>) {
+        self.generate_prelude(writer);
         for node in &self.nodes {
-            if Self::generate_node(node, scope) {
+            if Self::generate_node(node, scope, writer) {
                 break;
             };
         }
     }
+    
+}
+
+#[derive(Eq, PartialEq)]
+enum RunMode {
+    Object,
+    Linked
 }
 
 fn main() {
     let debug_mode = false;
 
-    let input = fs::read_to_string("src/input.tp").expect("no input file");
+    let args: Vec<String> = env::args().collect();
 
+    let mode = match args.get(1).unwrap().as_str() {
+	"o" => RunMode::Object,
+	"l" => RunMode::Linked,
+	_ => panic!("not a valid mode"),
+    };
+
+
+    let input_file = args.get(2).unwrap();
+    
+    let input = fs::read_to_string(input_file).expect("no input file");
+
+    let output_file = args.get(3).unwrap();
+
+    let mut output = fs::File::create((*output_file).clone()+".asm").unwrap();
+    
     let mut lexer = Lexer {
         current_position: 0,
         buffer: input,
@@ -1831,18 +1959,43 @@ fn main() {
     let mut generator = Generator {
         nodes: parser.nodes,
         current_node: 0,
+
     };
 
+    
     let mut scope = Scope {
         envs: Vec::new(),
         functions: HashMap::new(),
         label_counter: 0,
+	types: HashMap::new()
     };
+    scope.types.insert("nanpa".to_string(),
+	    Rc::new(Type{
+		name: "nanpa".to_string(),
+		size: 8
+	    }));
+
+
     scope.envs.push(Environment {
         names: HashMap::new(),
         stack_pointer: 0,
         tab_depth: 0,
     });
 
-    generator.generate(&mut scope);
+    generator.generate(&mut scope, &mut BufWriter::new(output));
+    
+    Command::new("fasm").arg((*output_file).clone()+".asm").output().unwrap();
+
+    if mode == RunMode::Linked {
+	Command::new("ld").args(&[
+	    (*output_file).clone()+".o",
+	    "lib/asen_asm.o".to_string(),
+	    "lib/pu.o".to_string()
+	]).output().unwrap();
+	
+	Command::new("mov").args(&[
+	    "a.out".to_string(),
+	    output_file.to_string()
+	]);
+    }
 }
